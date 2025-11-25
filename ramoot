@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Trophy, Users, Plus, X, Play, QrCode, Clock, CheckCircle, XCircle, AlertCircle } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Trophy, Users, Plus, X, Play, QrCode, Clock, CheckCircle, XCircle, AlertCircle, Home } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
@@ -19,12 +19,7 @@ import {
 } from 'firebase/firestore';
 
 // --- Firebase Yapılandırması ve Başlatma ---
-const firebaseConfig = // Import the functions you need from the SDKs you need
-import { initializeApp } from "firebase/app";
-// TODO: Add SDKs for Firebase products that you want to use
-// https://firebase.google.com/docs/web/setup#available-libraries
-
-// Your web app's Firebase configuration
+// Kullanıcının sağladığı yapılandırma bilgileri
 const firebaseConfig = {
   apiKey: "AIzaSyCWomiP6AUe13iKexXZAPibxvi67zrY11A",
   authDomain: "ramoot-game.firebaseapp.com",
@@ -34,12 +29,10 @@ const firebaseConfig = {
   appId: "1:403149392724:web:36fbcff884eec5bac6d6c1"
 };
 
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'ramoot-game-v1'; // App ID'sini sabit tutuyoruz
 
 const RamootGame = () => {
   const [user, setUser] = useState(null);
@@ -57,6 +50,9 @@ const RamootGame = () => {
     timerEndTime: null
   });
 
+  // Global Alert/Modal State
+  const [alert, setAlert] = useState({ visible: false, message: '', type: 'error' });
+
   // Admin/Host Form State
   const [newQuestion, setNewQuestion] = useState({
     question: '',
@@ -69,13 +65,24 @@ const RamootGame = () => {
   const [timeLeft, setTimeLeft] = useState(0);
   const [hasAnswered, setHasAnswered] = useState(false);
 
+  // --- Yardımcı Modal Fonksiyonu ---
+  const showModal = (message, type = 'error') => {
+    setAlert({ visible: true, message, type });
+    setTimeout(() => setAlert(prev => ({ ...prev, visible: false })), 3000);
+  };
+
   // --- Auth Başlatma ---
   useEffect(() => {
     const initAuth = async () => {
-      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-        await signInWithCustomToken(auth, __initial_auth_token);
-      } else {
-        await signInAnonymously(auth);
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Firebase Auth hatası:", error);
+        showModal("Giriş yapılırken hata oluştu. Lütfen konsolu kontrol edin.", "error");
       }
     };
     initAuth();
@@ -103,12 +110,13 @@ const RamootGame = () => {
         }
       } else {
         if (view !== 'home' && view !== 'admin') {
-          alert('Oyun sonlandırıldı veya bulunamadı.');
+          showModal('Oyun sonlandırıldı veya bulunamadı.', 'info');
           setView('home');
         }
       }
     }, (error) => {
       console.error("Veri okuma hatası:", error);
+      showModal("Veritabanından veri alınamadı.", "error");
     });
 
     return () => unsubscribe();
@@ -131,7 +139,7 @@ const RamootGame = () => {
       }, 1000);
       return () => clearInterval(interval);
     }
-  }, [gameState.status, gameState.timerEndTime, isHost]);
+  }, [gameState.status, gameState.timerEndTime, isHost, gameId]);
 
   // --- Soru Değiştiğinde Resetleme ---
   useEffect(() => {
@@ -154,7 +162,7 @@ const RamootGame = () => {
   const createGame = async () => {
     if (!user) return;
     if (gameState.questions.length === 0) {
-      alert('Lütfen en az bir soru ekleyin!');
+      showModal('Lütfen oyuna başlamadan önce en az bir soru ekleyin!', 'warning');
       return;
     }
 
@@ -175,13 +183,18 @@ const RamootGame = () => {
     try {
       await setDoc(doc(db, 'artifacts', appId, 'public', 'data', `game_${id}`), initialData);
       setView('lobby'); // QR ekranı
+      showModal(`Oyun başarıyla oluşturuldu! ID: ${id}`, 'success');
     } catch (error) {
       console.error("Oyun oluşturma hatası:", error);
-      alert("Oyun oluşturulamadı. Lütfen tekrar deneyin.");
+      showModal("Oyun oluşturulamadı. Lütfen tekrar deneyin.", "error");
     }
   };
 
   const startGame = async () => {
+    if (gameState.players.length === 0) {
+      showModal("Oyunu başlatmak için en az bir oyuncu olmalıdır.", "warning");
+      return;
+    }
     const gameRef = doc(db, 'artifacts', appId, 'public', 'data', `game_${gameId}`);
     const endTime = Date.now() + 20000; // 20 saniye
     await updateDoc(gameRef, { 
@@ -191,12 +204,25 @@ const RamootGame = () => {
     });
     setView('game');
   };
+  
+  const finishGame = async () => {
+    // Sadece host oyunu sonlandırabilir
+    if (!isHost) return;
+    const gameRef = doc(db, 'artifacts', appId, 'public', 'data', `game_${gameId}`);
+    try {
+      await updateDoc(gameRef, { status: 'final' });
+      setView('scoreboard');
+    } catch (error) {
+      console.error("Oyunu bitirme hatası:", error);
+    }
+  }
 
   const nextQuestion = async () => {
     const nextIdx = gameState.currentQuestionIndex + 1;
     const gameRef = doc(db, 'artifacts', appId, 'public', 'data', `game_${gameId}`);
 
     if (nextIdx >= gameState.questions.length) {
+      // Sorular bitti, skor tablosuna geç
       await updateDoc(gameRef, { status: 'final' });
       setView('scoreboard');
     } else {
@@ -216,7 +242,7 @@ const RamootGame = () => {
 
   const addQuestion = () => {
     if (!newQuestion.question || newQuestion.answers.some(a => !a)) {
-      alert('Lütfen tüm alanları doldurun!');
+      showModal('Lütfen soru ve tüm cevap seçeneklerini doldurun!', 'warning');
       return;
     }
     setGameState(prev => ({
@@ -224,12 +250,13 @@ const RamootGame = () => {
       questions: [...prev.questions, newQuestion]
     }));
     setNewQuestion({ question: '', answers: ['', '', '', ''], correctAnswer: 0 });
+    showModal('Soru başarıyla listeye eklendi.', 'success');
   };
 
   // --- Oyuncu Aksiyonları ---
   const joinGame = async () => {
     if (!gameId || !playerName) {
-      alert('Lütfen Oyun ID ve İsim giriniz!');
+      showModal('Lütfen Oyun ID ve İsim giriniz!', 'warning');
       return;
     }
     
@@ -242,7 +269,12 @@ const RamootGame = () => {
         
         // İsim kontrolü
         if (data.players.some(p => p.name === playerName)) {
-          alert("Bu isim zaten alınmış.");
+          showModal("Bu isim zaten alınmış.", 'warning');
+          return;
+        }
+        
+        if (data.status !== 'waiting') {
+          showModal("Bu oyun zaten başladı.", 'warning');
           return;
         }
 
@@ -258,11 +290,13 @@ const RamootGame = () => {
         
         setIsHost(false);
         // View otomatik olarak useEffect içinde güncellenecek
+        showModal(`Oyuna başarıyla katıldın: ${gameId}`, 'success');
       } else {
-        alert('Oyun bulunamadı!');
+        showModal('Oyun bulunamadı!', 'error');
       }
     } catch (error) {
       console.error("Katılma hatası:", error);
+      showModal("Oyuna katılırken bir hata oluştu.", "error");
     }
   };
 
@@ -274,14 +308,23 @@ const RamootGame = () => {
 
     const currentQ = gameState.questions[gameState.currentQuestionIndex];
     const isCorrect = answerIndex === currentQ.correctAnswer;
-    const points = isCorrect ? Math.max(0, Math.round(100 - ((20 - timeLeft) * 3))) : 0;
+    
+    // Cevap süresine göre puan hesapla
+    const maxPoints = 1000;
+    const timeLimit = 20; // saniye
+    const timeUsed = timeLimit - timeLeft;
+    
+    let points = 0;
+    if (isCorrect) {
+      // Hızlı cevaplama, daha çok puan
+      points = Math.max(100, Math.round(maxPoints * (1 - (timeUsed / timeLimit) * 0.5)));
+    }
+
 
     if (points > 0) {
-      // Puan güncelleme - Tüm player arrayini güncellememiz gerek (Firestore sınırlaması)
-      // Gerçek bir app'te bu bir transaction veya subcollection olmalı ama basit tutuyoruz.
+      // Puan güncelleme
       const gameRef = doc(db, 'artifacts', appId, 'public', 'data', `game_${gameId}`);
       
-      // Mevcut state'i kullanıp oyuncunun puanını artırıyoruz
       const updatedPlayers = gameState.players.map(p => {
         if (p.id === user.uid) {
           return { ...p, score: p.score + points };
@@ -289,8 +332,46 @@ const RamootGame = () => {
         return p;
       });
 
-      await updateDoc(gameRef, { players: updatedPlayers });
+      try {
+         await updateDoc(gameRef, { players: updatedPlayers });
+      } catch (error) {
+        console.error("Puan güncelleme hatası:", error);
+      }
     }
+  };
+  
+  // --- Modals and Utility Components ---
+  const UserInfoBox = () => (
+    <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 text-white shadow-xl w-full max-w-sm mx-auto mt-4 mb-8">
+      <div className="text-sm font-semibold text-slate-400 mb-1">Kullanıcı ID (Oturumun):</div>
+      <div className="font-mono text-xs break-all opacity-80">{user?.uid || "Yükleniyor..."}</div>
+    </div>
+  );
+
+  const CustomAlert = () => {
+    if (!alert.visible) return null;
+    
+    const baseClasses = "fixed bottom-5 left-1/2 -translate-x-1/2 p-4 rounded-xl shadow-2xl z-50 flex items-center gap-3 transition-all duration-300";
+    let styleClasses = '';
+    let Icon = AlertCircle;
+
+    if (alert.type === 'error') {
+      styleClasses = 'bg-red-600 text-white';
+      Icon = XCircle;
+    } else if (alert.type === 'success') {
+      styleClasses = 'bg-green-600 text-white';
+      Icon = CheckCircle;
+    } else if (alert.type === 'warning' || alert.type === 'info') {
+      styleClasses = 'bg-yellow-500 text-slate-900';
+      Icon = AlertCircle;
+    }
+
+    return (
+      <div className={`${baseClasses} ${styleClasses}`}>
+        <Icon size={24} />
+        <span className="font-semibold">{alert.message}</span>
+      </div>
+    );
   };
 
   // --- RENDER ---
@@ -298,7 +379,8 @@ const RamootGame = () => {
   // 1. HOME VIEW
   if (view === 'home') {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-500 flex items-center justify-center p-4 font-sans">
+      <div className="min-h-screen bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-500 flex flex-col items-center justify-center p-4 font-sans">
+        <CustomAlert />
         <div className="bg-white/95 backdrop-blur rounded-3xl shadow-2xl p-8 md:p-12 max-w-md w-full border border-white/20">
           <h1 className="text-6xl font-black text-center mb-2 text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-pink-600 tracking-tighter">
             RAMOOT
@@ -340,7 +422,7 @@ const RamootGame = () => {
               />
               <button
                 onClick={joinGame}
-                disabled={!gameId || !playerName}
+                disabled={!gameId || !playerName || !user}
                 className="w-full bg-gradient-to-r from-indigo-500 to-purple-600 text-white py-4 rounded-2xl font-bold text-lg hover:shadow-xl hover:shadow-indigo-500/30 transform hover:scale-[1.02] transition disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Oyuna Katıl
@@ -348,6 +430,7 @@ const RamootGame = () => {
             </div>
           </div>
         </div>
+        <UserInfoBox />
       </div>
     );
   }
@@ -356,6 +439,7 @@ const RamootGame = () => {
   if (view === 'admin') {
     return (
       <div className="min-h-screen bg-slate-50 p-4 md:p-8">
+        <CustomAlert />
         <div className="max-w-4xl mx-auto bg-white rounded-3xl shadow-xl p-8">
           <div className="flex justify-between items-center mb-8 border-b pb-4">
             <h2 className="text-3xl font-black text-slate-800">Soru Paneli</h2>
@@ -472,13 +556,14 @@ const RamootGame = () => {
       
       return (
         <div className="min-h-screen bg-slate-900 text-white p-4 flex flex-col items-center">
+           <CustomAlert />
            <div className="w-full max-w-6xl flex justify-between items-start mt-8 mb-12">
              <div>
                <h2 className="text-2xl text-slate-400 font-bold mb-2">Katılmak için:</h2>
                <div className="text-7xl font-black tracking-widest text-white mb-2">{gameId}</div>
              </div>
              <div className="bg-white p-4 rounded-xl">
-                <img src={qrUrl} alt="QR" className="w-32 h-32 md:w-48 md:h-48" />
+                <img src={qrUrl} alt="QR Kodu" className="w-32 h-32 md:w-48 md:h-48" />
              </div>
            </div>
 
@@ -515,8 +600,10 @@ const RamootGame = () => {
       );
     } else {
       // PLAYER EKRANI
+      const host = gameState.players.find(p => p.id === gameState.hostId);
       return (
         <div className="min-h-screen bg-indigo-600 flex flex-col items-center justify-center p-8 text-white text-center">
+          <CustomAlert />
           <div className="animate-pulse mb-8">
             <h1 className="text-4xl font-black mb-2">Hazır Ol!</h1>
             <p className="text-indigo-200">Host oyunu başlatınca ekranın değişecek.</p>
@@ -524,11 +611,15 @@ const RamootGame = () => {
           <div className="bg-white/10 backdrop-blur-md p-8 rounded-3xl border border-white/20 w-full max-w-sm">
             <div className="text-sm text-indigo-200 uppercase tracking-widest mb-1">Oyuncu Adın</div>
             <div className="text-3xl font-bold">{playerName}</div>
+            <div className="mt-4 text-sm text-indigo-300">
+               <span className="font-semibold">Oyun ID:</span> {gameId}
+            </div>
           </div>
           <div className="mt-8 flex items-center gap-2 text-indigo-300">
             <div className="w-2 h-2 bg-green-400 rounded-full animate-ping"></div>
-            Bağlandı
+            Bağlandı. Host: {host ? host.name : 'Bilinmiyor'}
           </div>
+          <UserInfoBox />
         </div>
       );
     }
@@ -543,9 +634,13 @@ const RamootGame = () => {
     if (isHost) {
       return (
         <div className="min-h-screen bg-gray-100 flex flex-col">
+          <CustomAlert />
           <div className="bg-white shadow-sm p-4 flex justify-between items-center">
              <div className="font-bold text-xl text-gray-500">Soru {gameState.currentQuestionIndex + 1} / {gameState.questions.length}</div>
-             <div className="text-4xl font-black text-indigo-600">{timeLeft}</div>
+             <div className="flex items-center gap-2 text-4xl font-black text-indigo-600">
+                <Clock size={32} className="text-indigo-400" />
+                {timeLeft}
+             </div>
              <div className="bg-gray-100 px-4 py-2 rounded-lg font-bold">
                {gameState.players.length} Oyuncu
              </div>
@@ -554,22 +649,22 @@ const RamootGame = () => {
           <div className="flex-1 flex flex-col items-center justify-center p-8 text-center max-w-5xl mx-auto w-full">
             {isResults ? (
                <div className="w-full animate-fade-in">
-                 <h2 className="text-4xl font-bold mb-12">Cevaplar</h2>
+                 <h2 className="text-4xl font-bold mb-12 text-slate-800">Cevaplar</h2>
                  <div className="grid grid-cols-2 gap-4 w-full">
                    {currentQ.answers.map((ans, i) => (
-                     <div key={i} className={`p-6 rounded-xl flex justify-between items-center text-left ${
-                       i === currentQ.correctAnswer ? 'bg-green-100 border-2 border-green-500' : 'bg-white border-2 border-gray-100 opacity-50'
+                     <div key={i} className={`p-6 rounded-xl flex justify-between items-center text-left shadow-md ${
+                       i === currentQ.correctAnswer ? 'bg-green-100 border-2 border-green-500' : 'bg-white border-2 border-gray-100 opacity-70'
                      }`}>
-                       <span className="text-xl font-bold">{ans}</span>
+                       <span className="text-xl font-bold text-slate-700">{ans}</span>
                        {i === currentQ.correctAnswer && <CheckCircle className="text-green-600" size={32} />}
                      </div>
                    ))}
                  </div>
                  <button 
                   onClick={nextQuestion}
-                  className="mt-12 bg-indigo-600 text-white px-12 py-4 rounded-xl font-bold text-xl hover:bg-indigo-700 transition"
+                  className="mt-12 bg-indigo-600 text-white px-12 py-4 rounded-xl font-bold text-xl hover:bg-indigo-700 transition shadow-lg"
                  >
-                   Sonraki Soru
+                   {gameState.currentQuestionIndex + 1 === gameState.questions.length ? 'Skor Tablosu' : 'Sonraki Soru'}
                  </button>
                </div>
             ) : (
@@ -600,25 +695,34 @@ const RamootGame = () => {
     // PLAYER GAME VIEW
     return (
       <div className="min-h-screen bg-slate-900 p-4 flex flex-col">
+        <CustomAlert />
         <div className="flex justify-between text-white mb-8">
            <div className="font-bold">Soru {gameState.currentQuestionIndex + 1}</div>
-           {/* Oyuncu süreyi görmese de olur, host ekranına bakar genelde ama ekleyelim */}
-           {!isResults && <div className="font-mono text-xl">{timeLeft}</div>}
+           {!isResults && <div className="font-mono text-xl text-yellow-400">{timeLeft} saniye</div>}
         </div>
 
         {isResults ? (
           <div className="flex-1 flex flex-col items-center justify-center text-center">
-             {selectedAnswer === currentQ.correctAnswer ? (
-               <div className="bg-green-500 text-white p-8 rounded-3xl w-full max-w-md animate-bounce">
-                 <CheckCircle size={64} className="mx-auto mb-4" />
-                 <h2 className="text-3xl font-black mb-2">Doğru!</h2>
-                 <p className="opacity-90">Harika gidiyorsun.</p>
-               </div>
-             ) : (
-               <div className="bg-red-500 text-white p-8 rounded-3xl w-full max-w-md">
-                 <XCircle size={64} className="mx-auto mb-4" />
-                 <h2 className="text-3xl font-black mb-2">Yanlış!</h2>
-                 <p className="opacity-90">Bir sonraki soruya odaklan.</p>
+             {selectedAnswer !== null && (
+               selectedAnswer === currentQ.correctAnswer ? (
+                 <div className="bg-green-500 text-white p-8 rounded-3xl w-full max-w-md animate-bounce">
+                   <CheckCircle size={64} className="mx-auto mb-4" />
+                   <h2 className="text-3xl font-black mb-2">Doğru!</h2>
+                   <p className="opacity-90">Sıradaki soruya hazırlan.</p>
+                 </div>
+               ) : (
+                 <div className="bg-red-500 text-white p-8 rounded-3xl w-full max-w-md">
+                   <XCircle size={64} className="mx-auto mb-4" />
+                   <h2 className="text-3xl font-black mb-2">Yanlış!</h2>
+                   <p className="opacity-90">Doğru cevap: {currentQ.answers[currentQ.correctAnswer]}</p>
+                 </div>
+               )
+             )}
+             {selectedAnswer === null && (
+               <div className="bg-slate-700 text-white p-8 rounded-3xl w-full max-w-md">
+                 <AlertCircle size={64} className="mx-auto mb-4 text-yellow-300" />
+                 <h2 className="text-3xl font-black mb-2">Cevap Veremedin</h2>
+                 <p className="opacity-90">Süre bitti. Daha hızlı olmalısın!</p>
                </div>
              )}
              <div className="mt-8 text-slate-400">Host'un devam etmesi bekleniyor...</div>
@@ -658,30 +762,29 @@ const RamootGame = () => {
     
     return (
       <div className="min-h-screen bg-gradient-to-br from-indigo-900 via-purple-900 to-slate-900 flex items-center justify-center p-4">
-        {/* Konfeti efekti burada CSS ile yapılabilir ama sade tutuyoruz */}
         <div className="bg-white rounded-3xl shadow-2xl overflow-hidden max-w-2xl w-full">
            <div className="bg-indigo-600 p-8 text-center text-white">
-             <Trophy size={64} className="mx-auto mb-4 text-yellow-400" />
-             <h1 className="text-4xl font-black">SONUÇLAR</h1>
+             <Trophy size={64} className="mx-auto mb-4 text-yellow-400 animate-pulse" />
+             <h1 className="text-4xl font-black">FİNAL SKOR TABLOSU</h1>
            </div>
            
            <div className="p-8">
              <div className="space-y-4">
-               {sortedPlayers.slice(0, 5).map((player, i) => (
-                 <div key={player.id} className={`flex items-center justify-between p-4 rounded-2xl border-2 ${
+               {sortedPlayers.map((player, i) => (
+                 <div key={player.id} className={`flex items-center justify-between p-4 rounded-2xl border-2 transition duration-300 ${
                    i === 0 ? 'border-yellow-400 bg-yellow-50 scale-105 shadow-lg' :
                    i === 1 ? 'border-gray-300 bg-gray-50' :
-                   i === 2 ? 'border-orange-300 bg-orange-50' : 'border-transparent'
+                   i === 2 ? 'border-orange-300 bg-orange-50' : 'border-indigo-100'
                  }`}>
                    <div className="flex items-center gap-4">
-                     <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-white ${
-                       i === 0 ? 'bg-yellow-400' : i === 1 ? 'bg-gray-400' : i === 2 ? 'bg-orange-400' : 'bg-indigo-100 text-indigo-600'
+                     <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-lg ${
+                       i === 0 ? 'bg-yellow-400 text-white' : i === 1 ? 'bg-gray-400 text-white' : i === 2 ? 'bg-orange-400 text-white' : 'bg-indigo-100 text-indigo-600'
                      }`}>
                        {i + 1}
                      </div>
                      <span className="font-bold text-xl text-gray-800">{player.name}</span>
                    </div>
-                   <div className="font-black text-2xl text-indigo-600">
+                   <div className="font-black text-3xl text-indigo-600">
                      {player.score}
                    </div>
                  </div>
@@ -695,10 +798,11 @@ const RamootGame = () => {
                    setGameId('');
                    setIsHost(false);
                    setGameState({ status: 'waiting', currentQuestionIndex: 0, players: [], questions: [], timerEndTime: null });
+                   setPlayerName(''); // İsimi de sıfırla
                  }}
-                 className="text-gray-500 hover:text-indigo-600 font-bold transition"
+                 className="text-gray-500 hover:text-indigo-600 font-bold transition flex items-center mx-auto gap-2"
                >
-                 Ana Ekrana Dön
+                 <Home size={20} /> Ana Ekrana Dön
                </button>
              </div>
            </div>
