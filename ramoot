@@ -1,817 +1,836 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Trophy, Users, Plus, X, Play, QrCode, Clock, CheckCircle, XCircle, AlertCircle, Home } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+
+// Firebase imports
 import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
 import { 
-  getAuth, 
-  signInAnonymously, 
-  onAuthStateChanged, 
-  signInWithCustomToken 
-} from 'firebase/auth';
-import { 
-  getFirestore, 
-  doc, 
-  setDoc, 
-  getDoc, 
-  updateDoc, 
-  onSnapshot, 
-  arrayUnion, 
-  collection 
+  getFirestore, doc, setDoc, getDoc, updateDoc, 
+  onSnapshot, collection, query, where, arrayUnion 
 } from 'firebase/firestore';
 
-// --- Firebase Yapılandırması ve Başlatma ---
-// Kullanıcının sağladığı yapılandırma bilgileri
-const firebaseConfig = {
-  apiKey: "AIzaSyCWomiP6AUe13iKexXZAPibxvi67zrY11A",
-  authDomain: "ramoot-game.firebaseapp.com",
-  projectId: "ramoot-game",
-  storageBucket: "ramoot-game.firebasestorage.app",
-  messagingSenderId: "403149392724",
-  appId: "1:403149392724:web:36fbcff884eec5bac6d6c1"
-};
+// --- Firebase ve Global Durum Yönetimi ---
 
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'ramoot-game-v1'; // App ID'sini sabit tutuyoruz
+// Global Canvas Değişkenlerini Kullan
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-const RamootGame = () => {
-  const [user, setUser] = useState(null);
-  const [view, setView] = useState('home'); // home, admin, lobby, game, scoreboard
+// Oyunun ana bileşeni
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
   const [gameId, setGameId] = useState('');
-  const [isHost, setIsHost] = useState(false);
-  const [playerName, setPlayerName] = useState('');
+  const [game, setGame] = useState(null);
+  const [mode, setMode] = useState('welcome'); // welcome | admin | player | create-questions
+  const [userName, setUserName] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  // Constants
+  const GAME_COLLECTION = 'ramoot_games';
+  const GAME_PATH = `/artifacts/${appId}/public/data/${GAME_COLLECTION}`;
   
-  // Oyun Verileri (Firestore'dan gelenler)
-  const [gameState, setGameState] = useState({
-    status: 'waiting', // waiting, question, results, final
-    currentQuestionIndex: 0,
-    players: [],
-    questions: [],
-    timerEndTime: null
+  // Quiz creation state
+  const [newQuestion, setNewQuestion] = useState({ 
+    text: '', 
+    options: ['', '', '', ''], 
+    correctAnswerIndex: 0 
   });
+  const [quizQuestions, setQuizQuestions] = useState([]);
 
-  // Global Alert/Modal State
-  const [alert, setAlert] = useState({ visible: false, message: '', type: 'error' });
 
-  // Admin/Host Form State
-  const [newQuestion, setNewQuestion] = useState({
-    question: '',
-    answers: ['', '', '', ''],
-    correctAnswer: 0
-  });
-
-  // Oyuncu State
-  const [selectedAnswer, setSelectedAnswer] = useState(null);
-  const [timeLeft, setTimeLeft] = useState(0);
-  const [hasAnswered, setHasAnswered] = useState(false);
-
-  // --- Yardımcı Modal Fonksiyonu ---
-  const showModal = (message, type = 'error') => {
-    setAlert({ visible: true, message, type });
-    setTimeout(() => setAlert(prev => ({ ...prev, visible: false })), 3000);
-  };
-
-  // --- Auth Başlatma ---
+  // 1. Firebase Initialization and Authentication
   useEffect(() => {
-    const initAuth = async () => {
-      try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (error) {
-        console.error("Firebase Auth hatası:", error);
-        showModal("Giriş yapılırken hata oluştu. Lütfen konsolu kontrol edin.", "error");
+    try {
+      if (!Object.keys(firebaseConfig).length) {
+        throw new Error("Firebase config is missing.");
       }
-    };
-    initAuth();
-    const unsubscribe = onAuthStateChanged(auth, setUser);
-    return () => unsubscribe();
+      
+      const app = initializeApp(firebaseConfig);
+      const firestore = getFirestore(app);
+      const firebaseAuth = getAuth(app);
+      
+      setDb(firestore);
+      setAuth(firebaseAuth);
+
+      const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+        if (!user) {
+          try {
+            // Sign in using the custom token if available, otherwise sign in anonymously
+            if (initialAuthToken) {
+              await signInWithCustomToken(firebaseAuth, initialAuthToken);
+            } else {
+              await signInAnonymously(firebaseAuth);
+            }
+          } catch (e) {
+            console.error("Auth Error:", e);
+            setError("Kimlik doğrulama hatası oluştu.");
+          }
+        }
+        setUserId(firebaseAuth.currentUser?.uid || crypto.randomUUID());
+        setIsAuthReady(true);
+      });
+
+      return () => unsubscribe();
+    } catch (e) {
+      console.error("Firebase Init Error:", e);
+      setError("Firebase başlatılırken bir hata oluştu.");
+    }
   }, []);
 
-  // --- Oyun Verilerini Dinleme (Sync) ---
+  // 2. Real-time Game State Listener (onSnapshot)
   useEffect(() => {
-    if (!gameId || !user) return;
+    if (!isAuthReady || !db || !gameId) return;
 
-    // Public koleksiyonu kullanıyoruz ki herkes erişebilsin
-    const gameRef = doc(db, 'artifacts', appId, 'public', 'data', `game_${gameId}`);
+    const gameDocRef = doc(db, GAME_PATH, gameId.toUpperCase());
     
-    const unsubscribe = onSnapshot(gameRef, (docSnap) => {
+    // Listen for real-time updates to the game document
+    const unsubscribe = onSnapshot(gameDocRef, (docSnap) => {
       if (docSnap.exists()) {
-        const data = docSnap.data();
-        setGameState(data);
+        const liveGameData = docSnap.data();
+        setGame(liveGameData);
         
-        // View mantığını state'e göre güncelle
-        if (!isHost) {
-          if (data.status === 'waiting') setView('lobby');
-          else if (data.status === 'question' || data.status === 'results') setView('game');
-          else if (data.status === 'final') setView('scoreboard');
+        // Auto-switch mode for players when the game starts
+        if (mode === 'welcome' && liveGameData.status !== 'lobby') {
+            setMode('player');
         }
+
       } else {
-        if (view !== 'home' && view !== 'admin') {
-          showModal('Oyun sonlandırıldı veya bulunamadı.', 'info');
-          setView('home');
+        // Game no longer exists or hasn't been created yet
+        setGame(null);
+        if (mode !== 'welcome' && mode !== 'create-questions') {
+          setError(`Oyun ID'si (${gameId.toUpperCase()}) bulunamadı veya sona erdi.`);
+          setMode('welcome');
+          setGameId('');
         }
       }
-    }, (error) => {
-      console.error("Veri okuma hatası:", error);
-      showModal("Veritabanından veri alınamadı.", "error");
+      setLoading(false);
+    }, (e) => {
+      console.error("Firestore Snapshot Error:", e);
+      setError("Oyun verileri çekilirken bir hata oluştu.");
+      setLoading(false);
     });
 
+    // Clean up the listener on component unmount or gameId change
     return () => unsubscribe();
-  }, [gameId, user, isHost]);
+  }, [db, gameId, isAuthReady, mode]);
 
-  // --- Zamanlayıcı Mantığı ---
-  useEffect(() => {
-    if (gameState.status === 'question' && gameState.timerEndTime) {
-      const interval = setInterval(() => {
-        const now = Date.now();
-        const diff = Math.ceil((gameState.timerEndTime - now) / 1000);
-        
-        if (diff <= 0) {
-          setTimeLeft(0);
-          if (isHost) handleTimeUp(); // Sadece host süreyi bitirebilir
-          clearInterval(interval);
-        } else {
-          setTimeLeft(diff);
-        }
-      }, 1000);
-      return () => clearInterval(interval);
-    }
-  }, [gameState.status, gameState.timerEndTime, isHost, gameId]);
 
-  // --- Soru Değiştiğinde Resetleme ---
-  useEffect(() => {
-    if (gameState.status === 'question') {
-      setSelectedAnswer(null);
-      setHasAnswered(false);
-    }
-  }, [gameState.currentQuestionIndex, gameState.status]);
+  // --- Helper Functions ---
 
-  // --- Yardımcı Fonksiyonlar ---
-  const generateGameId = () => Math.random().toString(36).substring(2, 8).toUpperCase();
+  const getGameRef = useCallback((id) => {
+    if (!db) return null;
+    return doc(db, GAME_PATH, id.toUpperCase());
+  }, [db, GAME_PATH]);
 
-  const handleTimeUp = async () => {
-    // Sadece host veritabanını günceller
-    const gameRef = doc(db, 'artifacts', appId, 'public', 'data', `game_${gameId}`);
-    await updateDoc(gameRef, { status: 'results' });
-  };
 
-  // --- Host Aksiyonları ---
+  // --- ADMIN/HOST Functions ---
+
+  // ADMIN: Yeni bir oyun oluşturur
   const createGame = async () => {
-    if (!user) return;
-    if (gameState.questions.length === 0) {
-      showModal('Lütfen oyuna başlamadan önce en az bir soru ekleyin!', 'warning');
-      return;
-    }
-
-    const id = generateGameId();
-    setGameId(id);
-    setIsHost(true);
-
-    const initialData = {
-      hostId: user.uid,
-      gameId: id,
-      status: 'waiting',
-      currentQuestionIndex: 0,
-      players: [],
-      questions: gameState.questions,
-      createdAt: Date.now()
-    };
-
-    try {
-      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', `game_${id}`), initialData);
-      setView('lobby'); // QR ekranı
-      showModal(`Oyun başarıyla oluşturuldu! ID: ${id}`, 'success');
-    } catch (error) {
-      console.error("Oyun oluşturma hatası:", error);
-      showModal("Oyun oluşturulamadı. Lütfen tekrar deneyin.", "error");
-    }
-  };
-
-  const startGame = async () => {
-    if (gameState.players.length === 0) {
-      showModal("Oyunu başlatmak için en az bir oyuncu olmalıdır.", "warning");
-      return;
-    }
-    const gameRef = doc(db, 'artifacts', appId, 'public', 'data', `game_${gameId}`);
-    const endTime = Date.now() + 20000; // 20 saniye
-    await updateDoc(gameRef, { 
-      status: 'question',
-      currentQuestionIndex: 0,
-      timerEndTime: endTime
-    });
-    setView('game');
-  };
-  
-  const finishGame = async () => {
-    // Sadece host oyunu sonlandırabilir
-    if (!isHost) return;
-    const gameRef = doc(db, 'artifacts', appId, 'public', 'data', `game_${gameId}`);
-    try {
-      await updateDoc(gameRef, { status: 'final' });
-      setView('scoreboard');
-    } catch (error) {
-      console.error("Oyunu bitirme hatası:", error);
-    }
-  }
-
-  const nextQuestion = async () => {
-    const nextIdx = gameState.currentQuestionIndex + 1;
-    const gameRef = doc(db, 'artifacts', appId, 'public', 'data', `game_${gameId}`);
-
-    if (nextIdx >= gameState.questions.length) {
-      // Sorular bitti, skor tablosuna geç
-      await updateDoc(gameRef, { status: 'final' });
-      setView('scoreboard');
-    } else {
-      const endTime = Date.now() + 20000;
-      await updateDoc(gameRef, { 
-        status: 'question', 
-        currentQuestionIndex: nextIdx,
-        timerEndTime: endTime
-      });
-    }
-  };
-
-  const deleteQuestion = (index) => {
-    const updatedQuestions = gameState.questions.filter((_, i) => i !== index);
-    setGameState(prev => ({ ...prev, questions: updatedQuestions }));
-  };
-
-  const addQuestion = () => {
-    if (!newQuestion.question || newQuestion.answers.some(a => !a)) {
-      showModal('Lütfen soru ve tüm cevap seçeneklerini doldurun!', 'warning');
-      return;
-    }
-    setGameState(prev => ({
-      ...prev,
-      questions: [...prev.questions, newQuestion]
-    }));
-    setNewQuestion({ question: '', answers: ['', '', '', ''], correctAnswer: 0 });
-    showModal('Soru başarıyla listeye eklendi.', 'success');
-  };
-
-  // --- Oyuncu Aksiyonları ---
-  const joinGame = async () => {
-    if (!gameId || !playerName) {
-      showModal('Lütfen Oyun ID ve İsim giriniz!', 'warning');
+    if (!isAuthReady || !db || !userId) {
+      setError("Sistem hazır değil. Lütfen bekleyin.");
       return;
     }
     
-    // Önce oyun var mı kontrol et
-    const gameRef = doc(db, 'artifacts', appId, 'public', 'data', `game_${gameId}`);
+    if (quizQuestions.length === 0) {
+      setError("Lütfen oyunu başlatmadan önce en az bir soru ekleyin.");
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+    const newGameId = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const newGameRef = getGameRef(newGameId);
+
+    try {
+      await setDoc(newGameRef, {
+        gameId: newGameId,
+        status: 'lobby',
+        adminId: userId,
+        currentQuestionIndex: -1,
+        questions: quizQuestions,
+        players: {}, // userId: { name, score, streak }
+        answersReceived: {}, // userId: true for current question
+        playerAnswers: {}, // userId: { answerIndex, timestamp }
+        createdAt: new Date().toISOString(),
+      });
+      setGameId(newGameId);
+      setMode('admin');
+    } catch (e) {
+      console.error("Create Game Error:", e);
+      setError("Oyun oluşturulurken bir hata oluştu.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ADMIN: Oyunu bir sonraki soruya ilerletir veya bitirir
+  const nextQuestion = async () => {
+    if (!game || game.adminId !== userId) return;
+
+    setLoading(true);
+    const newIndex = game.currentQuestionIndex + 1;
+    const gameRef = getGameRef(gameId);
+
+    try {
+      if (newIndex < game.questions.length) {
+        // Go to the next question
+        await updateDoc(gameRef, {
+          status: 'in-game',
+          currentQuestionIndex: newIndex,
+          answersReceived: {},
+          playerAnswers: {},
+        });
+      } else {
+        // End the game
+        await updateDoc(gameRef, {
+          status: 'score', // Final Scoreboard
+          currentQuestionIndex: newIndex,
+        });
+      }
+    } catch (e) {
+      console.error("Next Question Error:", e);
+      setError("Sonraki soruya geçilemedi.");
+    } finally {
+      setLoading(false);
+    }
+  };
+  
+  // ADMIN: Lobiden oyunu başlatır (currentQuestionIndex = 0)
+  const startGameFromLobby = async () => {
+    if (!game || game.adminId !== userId || game.status !== 'lobby') return;
+
+    setLoading(true);
+    const gameRef = getGameRef(gameId);
+    try {
+      await updateDoc(gameRef, {
+        status: 'in-game',
+        currentQuestionIndex: 0,
+        answersReceived: {},
+        playerAnswers: {},
+      });
+    } catch (e) {
+      console.error("Start Game Error:", e);
+      setError("Oyun başlatılırken bir hata oluştu.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+
+  // --- PLAYER Functions ---
+
+  // PLAYER: Var olan oyuna katılır
+  const joinGame = async () => {
+    if (!isAuthReady || !db || !userId || !gameId || !userName) {
+      setError("Lütfen Oyun ID ve Kullanıcı Adı girin.");
+      return;
+    }
+    setLoading(true);
+    setError('');
+    
+    const uppercaseGameId = gameId.toUpperCase();
+    const gameRef = getGameRef(uppercaseGameId);
+
     try {
       const docSnap = await getDoc(gameRef);
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        
-        // İsim kontrolü
-        if (data.players.some(p => p.name === playerName)) {
-          showModal("Bu isim zaten alınmış.", 'warning');
-          return;
-        }
-        
-        if (data.status !== 'waiting') {
-          showModal("Bu oyun zaten başladı.", 'warning');
-          return;
-        }
 
-        const newPlayer = {
-          id: user.uid,
-          name: playerName,
-          score: 0
-        };
-
-        await updateDoc(gameRef, {
-          players: arrayUnion(newPlayer)
-        });
-        
-        setIsHost(false);
-        // View otomatik olarak useEffect içinde güncellenecek
-        showModal(`Oyuna başarıyla katıldın: ${gameId}`, 'success');
-      } else {
-        showModal('Oyun bulunamadı!', 'error');
+      if (!docSnap.exists()) {
+        setError(`Oyun ID'si (${uppercaseGameId}) bulunamadı.`);
+        setLoading(false);
+        return;
       }
-    } catch (error) {
-      console.error("Katılma hatası:", error);
-      showModal("Oyuna katılırken bir hata oluştu.", "error");
-    }
-  };
-
-  const submitAnswer = async (answerIndex) => {
-    if (hasAnswered || gameState.status !== 'question') return;
-    
-    setSelectedAnswer(answerIndex);
-    setHasAnswered(true);
-
-    const currentQ = gameState.questions[gameState.currentQuestionIndex];
-    const isCorrect = answerIndex === currentQ.correctAnswer;
-    
-    // Cevap süresine göre puan hesapla
-    const maxPoints = 1000;
-    const timeLimit = 20; // saniye
-    const timeUsed = timeLimit - timeLeft;
-    
-    let points = 0;
-    if (isCorrect) {
-      // Hızlı cevaplama, daha çok puan
-      points = Math.max(100, Math.round(maxPoints * (1 - (timeUsed / timeLimit) * 0.5)));
-    }
-
-
-    if (points > 0) {
-      // Puan güncelleme
-      const gameRef = doc(db, 'artifacts', appId, 'public', 'data', `game_${gameId}`);
       
-      const updatedPlayers = gameState.players.map(p => {
-        if (p.id === user.uid) {
-          return { ...p, score: p.score + points };
-        }
-        return p;
+      const existingGame = docSnap.data();
+      
+      if (existingGame.status !== 'lobby') {
+        setError("Oyun çoktan başladı. Katılamazsınız.");
+        setLoading(false);
+        return;
+      }
+
+      // Check for name collision
+      const existingNames = Object.values(existingGame.players || {}).map(p => p.name.toLowerCase());
+      if (existingNames.includes(userName.toLowerCase())) {
+          setError(`'${userName}' adı zaten kullanımda. Lütfen başka bir isim seçin.`);
+          setLoading(false);
+          return;
+      }
+
+      // Add player to the game
+      const playerUpdate = {
+        name: userName,
+        score: 0,
+        streak: 0,
+      };
+
+      await updateDoc(gameRef, {
+        [`players.${userId}`]: playerUpdate,
       });
 
-      try {
-         await updateDoc(gameRef, { players: updatedPlayers });
-      } catch (error) {
-        console.error("Puan güncelleme hatası:", error);
-      }
+      setGameId(uppercaseGameId);
+      setMode('player'); // Switch to player mode (waiting in lobby)
+    } catch (e) {
+      console.error("Join Game Error:", e);
+      setError("Oyuna katılırken bir hata oluştu.");
+    } finally {
+      setLoading(false);
     }
   };
   
-  // --- Modals and Utility Components ---
-  const UserInfoBox = () => (
-    <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 text-white shadow-xl w-full max-w-sm mx-auto mt-4 mb-8">
-      <div className="text-sm font-semibold text-slate-400 mb-1">Kullanıcı ID (Oturumun):</div>
-      <div className="font-mono text-xs break-all opacity-80">{user?.uid || "Yükleniyor..."}</div>
-    </div>
+  // PLAYER: Cevabını gönderir
+  const submitAnswer = async (answerIndex) => {
+    if (!game || game.status !== 'in-game' || game.answersReceived[userId]) return;
+
+    const gameRef = getGameRef(gameId);
+    const question = game.questions[game.currentQuestionIndex];
+    const isCorrect = answerIndex === question.correctAnswerIndex;
+    const timestamp = Date.now();
+
+    // 1. Calculate Score (Points)
+    // Fast answer bonus: 1000 - (time taken / 10) capped at 200 points + 1000 base
+    const baseScore = 1000; 
+    let scoreEarned = 0;
+
+    if (isCorrect) {
+        // Simple scoring based on base + streak bonus
+        const streakBonus = game.players[userId].streak * 100; // Max 500 for a streak of 5
+        scoreEarned = baseScore + Math.min(streakBonus, 500);
+    }
+    
+    // 2. Update player stats and game state atomically
+    try {
+        await updateDoc(gameRef, {
+            // Mark the player as having answered
+            [`answersReceived.${userId}`]: true,
+            // Record the answer and time
+            [`playerAnswers.${userId}`]: { answerIndex, timestamp },
+            // Update player's score and streak
+            [`players.${userId}.score`]: game.players[userId].score + scoreEarned,
+            [`players.${userId}.streak`]: isCorrect ? game.players[userId].streak + 1 : 0,
+        });
+    } catch (e) {
+      console.error("Submit Answer Error:", e);
+      setError("Cevap gönderilirken bir hata oluştu.");
+    }
+  };
+
+
+  // --- Calculated Data ---
+
+  // Get current question and player data
+  const currentQuestion = useMemo(() => {
+    if (!game || game.currentQuestionIndex < 0 || game.currentQuestionIndex >= game.questions.length) {
+      return null;
+    }
+    return game.questions[game.currentQuestionIndex];
+  }, [game]);
+
+  // Player list sorted by score (for scoreboard)
+  const sortedPlayers = useMemo(() => {
+    if (!game || !game.players) return [];
+    return Object.values(game.players)
+      .sort((a, b) => b.score - a.score)
+      .map((player, index) => ({ 
+        ...player, 
+        rank: index + 1,
+        isCurrentUser: player.name === userName,
+      }));
+  }, [game, userName]);
+  
+  // Player statistics for the current user
+  const currentPlayer = useMemo(() => {
+      if (!game || !userId) return null;
+      return game.players[userId];
+  }, [game, userId]);
+
+  // Answered player count
+  const answeredCount = useMemo(() => {
+      if (!game || !game.answersReceived) return 0;
+      return Object.keys(game.answersReceived).length;
+  }, [game]);
+
+  // Is current user the admin?
+  const isAdmin = useMemo(() => game && userId === game.adminId, [game, userId]);
+
+
+  // --- UI Components ---
+
+  // A common button component with Tailwind styles
+  const Button = ({ onClick, children, className = '', disabled = false, color = 'bg-indigo-600 hover:bg-indigo-700' }) => (
+    <button
+      onClick={onClick}
+      disabled={disabled || loading}
+      className={`
+        ${color} text-white font-bold py-3 px-6 rounded-xl shadow-lg transition duration-200 
+        transform hover:scale-[1.02] active:scale-95 disabled:bg-gray-400 disabled:shadow-none
+        ${className}
+      `}
+    >
+      {loading ? 'Yükleniyor...' : children}
+    </button>
   );
 
-  const CustomAlert = () => {
-    if (!alert.visible) return null;
-    
-    const baseClasses = "fixed bottom-5 left-1/2 -translate-x-1/2 p-4 rounded-xl shadow-2xl z-50 flex items-center gap-3 transition-all duration-300";
-    let styleClasses = '';
-    let Icon = AlertCircle;
+  // Input field component
+  const Input = ({ label, value, onChange, placeholder, type = 'text', readOnly = false }) => (
+    <div className="mb-4">
+      <label className="block text-sm font-medium text-gray-700 mb-1">{label}</label>
+      <input
+        type={type}
+        value={value}
+        onChange={onChange}
+        placeholder={placeholder}
+        readOnly={readOnly}
+        className="w-full p-3 border border-gray-300 rounded-lg shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+      />
+    </div>
+  );
+  
+  // Quiz Creation Interface
+  const QuizCreation = () => {
 
-    if (alert.type === 'error') {
-      styleClasses = 'bg-red-600 text-white';
-      Icon = XCircle;
-    } else if (alert.type === 'success') {
-      styleClasses = 'bg-green-600 text-white';
-      Icon = CheckCircle;
-    } else if (alert.type === 'warning' || alert.type === 'info') {
-      styleClasses = 'bg-yellow-500 text-slate-900';
-      Icon = AlertCircle;
-    }
+    const handleQuestionChange = (e) => {
+      setNewQuestion(prev => ({ ...prev, text: e.target.value }));
+    };
+
+    const handleOptionChange = (index, e) => {
+      const newOptions = [...newQuestion.options];
+      newOptions[index] = e.target.value;
+      setNewQuestion(prev => ({ ...prev, options: newOptions }));
+    };
+
+    const handleAddQuestion = () => {
+      if (!newQuestion.text || newQuestion.options.some(opt => !opt)) {
+        setError("Lütfen soruyu ve tüm 4 cevabı doldurun.");
+        return;
+      }
+      setQuizQuestions(prev => [...prev, newQuestion]);
+      setNewQuestion({ 
+        text: '', 
+        options: ['', '', '', ''], 
+        correctAnswerIndex: 0 
+      });
+      setError('');
+    };
+
+    const handleDeleteQuestion = (index) => {
+      setQuizQuestions(prev => prev.filter((_, i) => i !== index));
+    };
 
     return (
-      <div className={`${baseClasses} ${styleClasses}`}>
-        <Icon size={24} />
-        <span className="font-semibold">{alert.message}</span>
+      <div className="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-4xl">
+        <h2 className="text-3xl font-extrabold text-indigo-700 mb-6 border-b pb-2">Ramoot Soru Editörü</h2>
+        
+        {/* Current Question Creator */}
+        <div className="p-5 border-2 border-indigo-200 rounded-xl mb-6 bg-indigo-50">
+          <h3 className="text-xl font-bold mb-4 text-indigo-800">Yeni Soru Ekle</h3>
+          <Input 
+            label="Soru Metni"
+            value={newQuestion.text}
+            onChange={handleQuestionChange}
+            placeholder="Sorunuzu buraya yazın..."
+          />
+          <div className="grid grid-cols-2 gap-4 mb-4">
+            {newQuestion.options.map((option, index) => (
+              <div key={index} className="flex items-center space-x-2">
+                <input
+                  type="radio"
+                  id={`correct-opt-${index}`}
+                  name="correct-option"
+                  checked={newQuestion.correctAnswerIndex === index}
+                  onChange={() => setNewQuestion(prev => ({ ...prev, correctAnswerIndex: index }))}
+                  className="w-5 h-5 text-green-500 focus:ring-green-500"
+                />
+                <Input
+                  label={`Cevap Seçeneği ${index + 1}`}
+                  value={option}
+                  onChange={(e) => handleOptionChange(index, e)}
+                  placeholder={`Seçenek ${index + 1}`}
+                />
+              </div>
+            ))}
+          </div>
+          <p className="text-sm text-gray-600 mb-4">
+            Doğru cevap: <span className="font-semibold text-green-600">Cevap Seçeneği {newQuestion.correctAnswerIndex + 1}</span>
+          </p>
+          <Button onClick={handleAddQuestion} color="bg-green-600 hover:bg-green-700" className="w-full">
+            Listeye Ekle ({quizQuestions.length + 1}. Soru)
+          </Button>
+        </div>
+
+        {/* Question List */}
+        <h3 className="text-2xl font-bold text-indigo-700 mb-4">Hazır Sorular ({quizQuestions.length})</h3>
+        {quizQuestions.length === 0 ? (
+          <p className="text-gray-500 italic">Henüz soru eklemediniz. Lütfen yukarıdaki formu kullanın.</p>
+        ) : (
+          <div className="space-y-3 max-h-60 overflow-y-auto pr-2">
+            {quizQuestions.map((q, index) => (
+              <div key={index} className="flex justify-between items-start bg-gray-50 p-3 rounded-lg border">
+                <div>
+                  <p className="font-semibold text-gray-800">Soru {index + 1}: {q.text}</p>
+                  <p className="text-sm text-green-600 mt-1">
+                    Doğru Cevap: {q.options[q.correctAnswerIndex]}
+                  </p>
+                </div>
+                <button 
+                  onClick={() => handleDeleteQuestion(index)}
+                  className="text-red-500 hover:text-red-700 text-sm font-semibold ml-4 p-1"
+                >
+                  Sil
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        
+        <div className="mt-8 border-t pt-4">
+          <Button onClick={createGame} disabled={quizQuestions.length === 0} className="w-full">
+            Oyunu Oluştur ve Lobiye Git ({quizQuestions.length} Soru)
+          </Button>
+        </div>
       </div>
     );
   };
 
-  // --- RENDER ---
 
-  // 1. HOME VIEW
-  if (view === 'home') {
+  // Game Lobby (Admin & Player)
+  const Lobby = () => {
+    if (!game) return <div className="text-center text-xl text-red-500">Oyun yüklenemedi.</div>;
+
+    const gameLink = `${window.location.origin}/?gameId=${game.gameId}`;
+
     return (
-      <div className="min-h-screen bg-gradient-to-br from-indigo-600 via-purple-600 to-pink-500 flex flex-col items-center justify-center p-4 font-sans">
-        <CustomAlert />
-        <div className="bg-white/95 backdrop-blur rounded-3xl shadow-2xl p-8 md:p-12 max-w-md w-full border border-white/20">
-          <h1 className="text-6xl font-black text-center mb-2 text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-pink-600 tracking-tighter">
-            RAMOOT
-          </h1>
-          <p className="text-center text-gray-500 mb-8 font-medium">Online Quiz Battle</p>
-          
-          <div className="space-y-4">
-            <button
-              onClick={() => setView('admin')}
-              className="w-full bg-slate-900 text-white py-4 rounded-2xl font-bold text-lg hover:bg-slate-800 transform hover:scale-[1.02] transition shadow-lg"
+      <div className="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-2xl text-center">
+        <h2 className="text-4xl font-extrabold text-indigo-700 mb-4">Ramoot Lobi</h2>
+        <p className="text-xl text-gray-600 mb-8">Oyuncuların Katılmasını Bekliyor...</p>
+        
+        <div className="bg-indigo-50 p-6 rounded-xl border border-indigo-200 mb-8">
+          <p className="text-2xl font-bold text-indigo-800">Oyun ID'si</p>
+          <p className="text-6xl font-black text-indigo-900 mt-2">{game.gameId}</p>
+          {isAdmin && (
+              <div className="mt-4">
+                  <Input 
+                    label="Paylaşılabilir Bağlantı (Kopyalayın)"
+                    value={gameLink}
+                    readOnly
+                  />
+                  <button
+                    onClick={() => {
+                        document.execCommand('copy', false, gameLink);
+                        setError('Bağlantı panoya kopyalandı!');
+                        setTimeout(() => setError(''), 3000);
+                    }}
+                    className="mt-2 text-sm text-indigo-600 hover:text-indigo-800 font-medium"
+                  >
+                    Bağlantıyı Kopyala
+                  </button>
+              </div>
+          )}
+        </div>
+
+        <h3 className="text-2xl font-bold text-gray-700 mb-4">Katılan Oyuncular ({Object.keys(game.players).length})</h3>
+        <div className="flex flex-wrap justify-center gap-2 max-h-40 overflow-y-auto p-2">
+          {Object.values(game.players).map((player) => (
+            <span 
+              key={player.name} 
+              className={`px-4 py-2 rounded-full font-semibold shadow-md ${
+                player.name === userName ? 'bg-green-500 text-white' : 'bg-gray-200 text-gray-800'
+              }`}
             >
-              Oyun Oluştur (Admin)
-            </button>
-            
-            <div className="relative pt-4">
-              <div className="absolute inset-0 flex items-center">
-                <div className="w-full border-t border-gray-300"></div>
-              </div>
-              <div className="relative flex justify-center text-sm">
-                <span className="px-2 bg-white text-gray-500">VEYA</span>
-              </div>
-            </div>
-
-            <div className="space-y-3">
-              <input
-                type="text"
-                placeholder="Oyun ID (6 Haneli)"
-                value={gameId}
-                onChange={(e) => setGameId(e.target.value.toUpperCase())}
-                maxLength={6}
-                className="w-full px-4 py-4 bg-gray-50 border-2 border-gray-200 rounded-2xl focus:border-indigo-500 focus:ring-2 focus:ring-indigo-200 focus:outline-none text-center text-xl font-bold tracking-widest uppercase placeholder:normal-case placeholder:font-normal placeholder:tracking-normal"
-              />
-              <input
-                type="text"
-                placeholder="Adın nedir?"
-                value={playerName}
-                onChange={(e) => setPlayerName(e.target.value)}
-                className="w-full px-4 py-4 bg-gray-50 border-2 border-gray-200 rounded-2xl focus:border-indigo-500 focus:ring-2 focus:ring-indigo-200 focus:outline-none text-center text-lg font-semibold"
-              />
-              <button
-                onClick={joinGame}
-                disabled={!gameId || !playerName || !user}
-                className="w-full bg-gradient-to-r from-indigo-500 to-purple-600 text-white py-4 rounded-2xl font-bold text-lg hover:shadow-xl hover:shadow-indigo-500/30 transform hover:scale-[1.02] transition disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Oyuna Katıl
-              </button>
-            </div>
-          </div>
-        </div>
-        <UserInfoBox />
-      </div>
-    );
-  }
-
-  // 2. ADMIN VIEW (Soru Ekleme)
-  if (view === 'admin') {
-    return (
-      <div className="min-h-screen bg-slate-50 p-4 md:p-8">
-        <CustomAlert />
-        <div className="max-w-4xl mx-auto bg-white rounded-3xl shadow-xl p-8">
-          <div className="flex justify-between items-center mb-8 border-b pb-4">
-            <h2 className="text-3xl font-black text-slate-800">Soru Paneli</h2>
-            <button onClick={() => setView('home')} className="p-2 hover:bg-gray-100 rounded-full transition">
-              <X size={28} className="text-gray-500" />
-            </button>
-          </div>
-
-          <div className="grid md:grid-cols-2 gap-8">
-            <div className="space-y-6">
-              <div className="bg-indigo-50 p-6 rounded-2xl border border-indigo-100">
-                <h3 className="text-xl font-bold mb-4 text-indigo-900">Yeni Soru Ekle</h3>
-                <input
-                  type="text"
-                  placeholder="Sorunuzu buraya yazın..."
-                  value={newQuestion.question}
-                  onChange={(e) => setNewQuestion({ ...newQuestion, question: e.target.value })}
-                  className="w-full px-4 py-3 mb-4 border-2 border-indigo-200 rounded-xl focus:border-indigo-500 focus:outline-none font-medium"
-                />
-                <div className="space-y-3">
-                  {newQuestion.answers.map((answer, i) => (
-                    <div key={i} className="flex gap-2">
-                      <div className={`flex items-center justify-center w-8 font-bold ${
-                         i === 0 ? 'text-red-500' : i === 1 ? 'text-blue-500' : i === 2 ? 'text-yellow-500' : 'text-green-500'
-                      }`}>
-                        {['A','B','C','D'][i]}
-                      </div>
-                      <input
-                        type="text"
-                        placeholder={`Cevap Seçeneği ${i + 1}`}
-                        value={answer}
-                        onChange={(e) => {
-                          const newAnswers = [...newQuestion.answers];
-                          newAnswers[i] = e.target.value;
-                          setNewQuestion({ ...newQuestion, answers: newAnswers });
-                        }}
-                        className="flex-1 px-4 py-3 border border-gray-200 rounded-xl focus:border-indigo-500 focus:outline-none"
-                      />
-                      <button
-                        onClick={() => setNewQuestion({ ...newQuestion, correctAnswer: i })}
-                        className={`px-4 rounded-xl font-bold transition ${
-                          newQuestion.correctAnswer === i
-                            ? 'bg-green-500 text-white shadow-md'
-                            : 'bg-gray-100 text-gray-400 hover:bg-gray-200'
-                        }`}
-                      >
-                        {newQuestion.correctAnswer === i ? <CheckCircle size={20} /> : <div className="w-5 h-5 rounded-full border-2 border-gray-300"></div>}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-                <button
-                  onClick={addQuestion}
-                  className="w-full mt-6 bg-indigo-600 text-white py-3 rounded-xl font-bold hover:bg-indigo-700 transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-200"
-                >
-                  <Plus size={20} /> Listeye Ekle
-                </button>
-              </div>
-            </div>
-
-            <div className="bg-gray-50 rounded-2xl p-6 border border-gray-200 h-fit">
-              <h3 className="text-xl font-bold mb-4 text-gray-800 flex items-center justify-between">
-                <span>Eklenen Sorular</span>
-                <span className="bg-gray-200 text-gray-600 px-3 py-1 rounded-full text-sm">{gameState.questions.length}</span>
-              </h3>
-              <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
-                {gameState.questions.length === 0 && (
-                  <div className="text-center py-8 text-gray-400">
-                    Henüz soru eklenmedi.
-                  </div>
-                )}
-                {gameState.questions.map((q, i) => (
-                  <div key={i} className="group bg-white p-4 rounded-xl shadow-sm border border-gray-100 hover:border-indigo-200 transition">
-                    <div className="flex justify-between items-start gap-3">
-                      <div>
-                        <span className="font-bold text-indigo-600 mr-2">#{i + 1}</span>
-                        <span className="font-medium text-gray-800">{q.question}</span>
-                      </div>
-                      <button
-                        onClick={() => deleteQuestion(i)}
-                        className="text-gray-300 hover:text-red-500 transition opacity-0 group-hover:opacity-100"
-                      >
-                        <X size={18} />
-                      </button>
-                    </div>
-                    <div className="mt-2 text-xs text-green-600 font-medium bg-green-50 inline-block px-2 py-1 rounded">
-                      Doğru: {q.answers[q.correctAnswer]}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-8 pt-6 border-t flex justify-end">
-             <button
-              onClick={createGame}
-              className="bg-gradient-to-r from-green-500 to-emerald-600 text-white py-4 px-12 rounded-2xl font-bold text-xl hover:shadow-xl hover:shadow-green-500/30 transform hover:scale-105 transition flex items-center gap-3"
-            >
-              <Play size={24} fill="currentColor" /> Oyunu Başlat
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // 3. LOBBY VIEW (QR Code & Waiting)
-  if (view === 'lobby') {
-    if (isHost) {
-      // HOST EKRANI
-      const gameUrl = window.location.href.split('?')[0] + `?game=${gameId}`;
-      const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(gameUrl)}`;
-      
-      return (
-        <div className="min-h-screen bg-slate-900 text-white p-4 flex flex-col items-center">
-           <CustomAlert />
-           <div className="w-full max-w-6xl flex justify-between items-start mt-8 mb-12">
-             <div>
-               <h2 className="text-2xl text-slate-400 font-bold mb-2">Katılmak için:</h2>
-               <div className="text-7xl font-black tracking-widest text-white mb-2">{gameId}</div>
-             </div>
-             <div className="bg-white p-4 rounded-xl">
-                <img src={qrUrl} alt="QR Kodu" className="w-32 h-32 md:w-48 md:h-48" />
-             </div>
-           </div>
-
-           <div className="flex-1 w-full max-w-6xl">
-             <div className="flex items-center gap-4 mb-6">
-               <Users size={32} className="text-indigo-400" />
-               <h3 className="text-3xl font-bold">Oyuncular ({gameState.players.length})</h3>
-             </div>
-             
-             <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
-               {gameState.players.map((p, i) => (
-                 <div key={i} className="bg-slate-800 p-4 rounded-xl border border-slate-700 font-bold text-center animate-bounce-in">
-                   {p.name}
-                 </div>
-               ))}
-               {gameState.players.length === 0 && (
-                 <div className="col-span-full text-center py-12 text-slate-600 text-xl">
-                   Oyuncular bekleniyor...
-                 </div>
-               )}
-             </div>
-           </div>
-
-           <div className="w-full max-w-6xl mt-8 mb-8">
-             <button
-              onClick={startGame}
-              disabled={gameState.players.length === 0}
-              className="w-full bg-indigo-600 text-white py-6 rounded-2xl font-black text-2xl hover:bg-indigo-500 transition disabled:opacity-30 disabled:cursor-not-allowed"
-            >
-              BAŞLAT
-            </button>
-           </div>
-        </div>
-      );
-    } else {
-      // PLAYER EKRANI
-      const host = gameState.players.find(p => p.id === gameState.hostId);
-      return (
-        <div className="min-h-screen bg-indigo-600 flex flex-col items-center justify-center p-8 text-white text-center">
-          <CustomAlert />
-          <div className="animate-pulse mb-8">
-            <h1 className="text-4xl font-black mb-2">Hazır Ol!</h1>
-            <p className="text-indigo-200">Host oyunu başlatınca ekranın değişecek.</p>
-          </div>
-          <div className="bg-white/10 backdrop-blur-md p-8 rounded-3xl border border-white/20 w-full max-w-sm">
-            <div className="text-sm text-indigo-200 uppercase tracking-widest mb-1">Oyuncu Adın</div>
-            <div className="text-3xl font-bold">{playerName}</div>
-            <div className="mt-4 text-sm text-indigo-300">
-               <span className="font-semibold">Oyun ID:</span> {gameId}
-            </div>
-          </div>
-          <div className="mt-8 flex items-center gap-2 text-indigo-300">
-            <div className="w-2 h-2 bg-green-400 rounded-full animate-ping"></div>
-            Bağlandı. Host: {host ? host.name : 'Bilinmiyor'}
-          </div>
-          <UserInfoBox />
-        </div>
-      );
-    }
-  }
-
-  // 4. GAME VIEW
-  if (view === 'game') {
-    const currentQ = gameState.questions[gameState.currentQuestionIndex];
-    const isResults = gameState.status === 'results';
-
-    // HOST GAME VIEW
-    if (isHost) {
-      return (
-        <div className="min-h-screen bg-gray-100 flex flex-col">
-          <CustomAlert />
-          <div className="bg-white shadow-sm p-4 flex justify-between items-center">
-             <div className="font-bold text-xl text-gray-500">Soru {gameState.currentQuestionIndex + 1} / {gameState.questions.length}</div>
-             <div className="flex items-center gap-2 text-4xl font-black text-indigo-600">
-                <Clock size={32} className="text-indigo-400" />
-                {timeLeft}
-             </div>
-             <div className="bg-gray-100 px-4 py-2 rounded-lg font-bold">
-               {gameState.players.length} Oyuncu
-             </div>
-          </div>
-
-          <div className="flex-1 flex flex-col items-center justify-center p-8 text-center max-w-5xl mx-auto w-full">
-            {isResults ? (
-               <div className="w-full animate-fade-in">
-                 <h2 className="text-4xl font-bold mb-12 text-slate-800">Cevaplar</h2>
-                 <div className="grid grid-cols-2 gap-4 w-full">
-                   {currentQ.answers.map((ans, i) => (
-                     <div key={i} className={`p-6 rounded-xl flex justify-between items-center text-left shadow-md ${
-                       i === currentQ.correctAnswer ? 'bg-green-100 border-2 border-green-500' : 'bg-white border-2 border-gray-100 opacity-70'
-                     }`}>
-                       <span className="text-xl font-bold text-slate-700">{ans}</span>
-                       {i === currentQ.correctAnswer && <CheckCircle className="text-green-600" size={32} />}
-                     </div>
-                   ))}
-                 </div>
-                 <button 
-                  onClick={nextQuestion}
-                  className="mt-12 bg-indigo-600 text-white px-12 py-4 rounded-xl font-bold text-xl hover:bg-indigo-700 transition shadow-lg"
-                 >
-                   {gameState.currentQuestionIndex + 1 === gameState.questions.length ? 'Skor Tablosu' : 'Sonraki Soru'}
-                 </button>
-               </div>
-            ) : (
-              <>
-                <h2 className="text-4xl md:text-5xl font-black text-gray-800 mb-16 leading-tight">
-                  {currentQ.question}
-                </h2>
-                <div className="grid grid-cols-2 gap-6 w-full">
-                   {/* Host cevapları göstermez, sadece şekilleri gösterir ki oyuncular ekranına baksın */}
-                   {currentQ.answers.map((ans, i) => (
-                     <div key={i} className={`h-32 rounded-2xl flex items-center px-8 text-2xl font-bold text-white shadow-lg ${
-                        i === 0 ? 'bg-red-500' : i === 1 ? 'bg-blue-500' : i === 2 ? 'bg-yellow-500' : 'bg-green-500'
-                     }`}>
-                       <span className="mr-4 bg-black/20 w-10 h-10 rounded-full flex items-center justify-center text-sm">
-                         {['▲', '◆', '●', '■'][i]}
-                       </span>
-                       {ans}
-                     </div>
-                   ))}
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      );
-    }
-
-    // PLAYER GAME VIEW
-    return (
-      <div className="min-h-screen bg-slate-900 p-4 flex flex-col">
-        <CustomAlert />
-        <div className="flex justify-between text-white mb-8">
-           <div className="font-bold">Soru {gameState.currentQuestionIndex + 1}</div>
-           {!isResults && <div className="font-mono text-xl text-yellow-400">{timeLeft} saniye</div>}
+              {player.name}
+            </span>
+          ))}
         </div>
 
-        {isResults ? (
-          <div className="flex-1 flex flex-col items-center justify-center text-center">
-             {selectedAnswer !== null && (
-               selectedAnswer === currentQ.correctAnswer ? (
-                 <div className="bg-green-500 text-white p-8 rounded-3xl w-full max-w-md animate-bounce">
-                   <CheckCircle size={64} className="mx-auto mb-4" />
-                   <h2 className="text-3xl font-black mb-2">Doğru!</h2>
-                   <p className="opacity-90">Sıradaki soruya hazırlan.</p>
-                 </div>
-               ) : (
-                 <div className="bg-red-500 text-white p-8 rounded-3xl w-full max-w-md">
-                   <XCircle size={64} className="mx-auto mb-4" />
-                   <h2 className="text-3xl font-black mb-2">Yanlış!</h2>
-                   <p className="opacity-90">Doğru cevap: {currentQ.answers[currentQ.correctAnswer]}</p>
-                 </div>
-               )
-             )}
-             {selectedAnswer === null && (
-               <div className="bg-slate-700 text-white p-8 rounded-3xl w-full max-w-md">
-                 <AlertCircle size={64} className="mx-auto mb-4 text-yellow-300" />
-                 <h2 className="text-3xl font-black mb-2">Cevap Veremedin</h2>
-                 <p className="opacity-90">Süre bitti. Daha hızlı olmalısın!</p>
-               </div>
-             )}
-             <div className="mt-8 text-slate-400">Host'un devam etmesi bekleniyor...</div>
-          </div>
-        ) : (
-          <div className="flex-1 grid grid-cols-2 gap-4 content-center">
-             {/* Oyuncu sadece renkli butonları görür, kahoot tarzı */}
-             {['red', 'blue', 'yellow', 'green'].map((color, i) => (
-               <button
-                 key={i}
-                 disabled={hasAnswered}
-                 onClick={() => submitAnswer(i)}
-                 className={`h-full min-h-[150px] rounded-2xl flex flex-col items-center justify-center transition transform active:scale-95 ${
-                   hasAnswered 
-                     ? (selectedAnswer === i ? 'opacity-100 ring-4 ring-white' : 'opacity-20')
-                     : 'opacity-100 hover:brightness-110'
-                 } ${
-                   color === 'red' ? 'bg-red-500' : 
-                   color === 'blue' ? 'bg-blue-500' : 
-                   color === 'yellow' ? 'bg-yellow-500' : 'bg-green-500'
-                 }`}
-               >
-                 <span className="text-6xl text-white drop-shadow-md">
-                    {['▲', '◆', '●', '■'][i]}
-                 </span>
-               </button>
-             ))}
-          </div>
+        {isAdmin && (
+          <Button onClick={startGameFromLobby} disabled={Object.keys(game.players).length === 0} className="mt-8 w-full">
+            {Object.keys(game.players).length > 0 ? 'Oyunu BAŞLAT' : 'Oyuncu Bekleniyor...'}
+          </Button>
         )}
       </div>
     );
-  }
+  };
+  
+  // In-Game Question Screen (Admin)
+  const AdminGameScreen = () => {
+    if (!game || !currentQuestion) return <div className="text-center text-xl text-red-500">Hata: Soru yüklenemedi.</div>;
 
-  // 5. SCOREBOARD VIEW
-  if (view === 'scoreboard') {
-    const sortedPlayers = [...gameState.players].sort((a, b) => b.score - a.score);
+    const totalPlayers = Object.keys(game.players).length;
     
-    return (
-      <div className="min-h-screen bg-gradient-to-br from-indigo-900 via-purple-900 to-slate-900 flex items-center justify-center p-4">
-        <div className="bg-white rounded-3xl shadow-2xl overflow-hidden max-w-2xl w-full">
-           <div className="bg-indigo-600 p-8 text-center text-white">
-             <Trophy size={64} className="mx-auto mb-4 text-yellow-400 animate-pulse" />
-             <h1 className="text-4xl font-black">FİNAL SKOR TABLOSU</h1>
-           </div>
-           
-           <div className="p-8">
-             <div className="space-y-4">
-               {sortedPlayers.map((player, i) => (
-                 <div key={player.id} className={`flex items-center justify-between p-4 rounded-2xl border-2 transition duration-300 ${
-                   i === 0 ? 'border-yellow-400 bg-yellow-50 scale-105 shadow-lg' :
-                   i === 1 ? 'border-gray-300 bg-gray-50' :
-                   i === 2 ? 'border-orange-300 bg-orange-50' : 'border-indigo-100'
-                 }`}>
-                   <div className="flex items-center gap-4">
-                     <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-lg ${
-                       i === 0 ? 'bg-yellow-400 text-white' : i === 1 ? 'bg-gray-400 text-white' : i === 2 ? 'bg-orange-400 text-white' : 'bg-indigo-100 text-indigo-600'
-                     }`}>
-                       {i + 1}
-                     </div>
-                     <span className="font-bold text-xl text-gray-800">{player.name}</span>
-                   </div>
-                   <div className="font-black text-3xl text-indigo-600">
-                     {player.score}
-                   </div>
-                 </div>
-               ))}
-             </div>
+    // Check if the current question is finished
+    const isQuestionFinished = answeredCount === totalPlayers;
+    
+    // Determine the answer state for the current question
+    const answerSummary = currentQuestion.options.map((option, index) => {
+        const correct = index === currentQuestion.correctAnswerIndex;
+        const totalAnswers = Object.values(game.playerAnswers).filter(a => a.answerIndex === index).length;
+        const percentage = totalPlayers > 0 ? Math.round((totalAnswers / totalPlayers) * 100) : 0;
+        
+        return { option, totalAnswers, percentage, correct, index };
+    });
+    
+    const colors = ['bg-red-500', 'bg-blue-500', 'bg-yellow-500', 'bg-green-500'];
 
-             <div className="mt-8 text-center">
-               <button
-                 onClick={() => {
-                   setView('home');
-                   setGameId('');
-                   setIsHost(false);
-                   setGameState({ status: 'waiting', currentQuestionIndex: 0, players: [], questions: [], timerEndTime: null });
-                   setPlayerName(''); // İsimi de sıfırla
-                 }}
-                 className="text-gray-500 hover:text-indigo-600 font-bold transition flex items-center mx-auto gap-2"
-               >
-                 <Home size={20} /> Ana Ekrana Dön
-               </button>
-             </div>
-           </div>
+    return (
+      <div className="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-4xl">
+        <div className="flex justify-between items-center mb-6 border-b pb-4">
+          <h2 className="text-3xl font-extrabold text-indigo-700">
+            Soru {game.currentQuestionIndex + 1} / {game.questions.length}
+          </h2>
+          <span className="text-xl font-bold text-gray-600">
+            {answeredCount} / {totalPlayers} Cevapladı
+          </span>
+        </div>
+
+        <div className="bg-gray-100 p-8 rounded-xl mb-8">
+          <p className="text-3xl font-semibold text-gray-800 text-center">{currentQuestion.text}</p>
+        </div>
+
+        <div className="grid grid-cols-2 gap-4">
+          {currentQuestion.options.map((option, index) => (
+            <div key={index} className={`p-4 rounded-xl text-white font-bold text-lg transition duration-300 shadow-md ${colors[index]} ${isQuestionFinished ? 'opacity-100' : 'opacity-70'}`}>
+              {option}
+              {isQuestionFinished && (
+                  <div className="mt-2 text-sm bg-black bg-opacity-30 p-2 rounded-lg">
+                      <p>Cevap Sayısı: {answerSummary[index].totalAnswers}</p>
+                      <p>Oran: {answerSummary[index].percentage}%</p>
+                      {answerSummary[index].correct && <p className="text-yellow-300">✓ DOĞRU CEVAP</p>}
+                  </div>
+              )}
+            </div>
+          ))}
+        </div>
+        
+        <div className="mt-8 border-t pt-4">
+          <Button onClick={nextQuestion} className="w-full" disabled={!isQuestionFinished}>
+            {game.currentQuestionIndex + 1 < game.questions.length ? 'Sonraki Soruya Geç' : 'Skor Tablosunu Göster'}
+          </Button>
         </div>
       </div>
     );
+  };
+  
+  // In-Game Answer Screen (Player)
+  const PlayerGameScreen = () => {
+    if (!game || !currentQuestion || !currentPlayer) return <div className="text-center text-xl text-red-500">Hata: Oyun verisi eksik.</div>;
+
+    const hasAnswered = game.answersReceived[userId];
+    const colors = ['bg-red-500 hover:bg-red-600', 'bg-blue-500 hover:bg-blue-600', 'bg-yellow-500 hover:bg-yellow-600', 'bg-green-500 hover:bg-green-600'];
+    const answerIndex = game.playerAnswers[userId]?.answerIndex;
+    
+    // Check if the admin has moved to the next question (implicitly ending the current one)
+    const isQuestionOver = game.status === 'in-game' && game.answersReceived[game.adminId]; // Simple proxy for question end on player side
+
+    return (
+      <div className="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-2xl text-center">
+        <h2 className="text-3xl font-extrabold text-indigo-700 mb-6">
+          {hasAnswered ? 'Cevap Gönderildi!' : `Soru ${game.currentQuestionIndex + 1}`}
+        </h2>
+        
+        <div className="bg-gray-100 p-6 rounded-xl mb-6">
+          <p className="text-xl font-semibold text-gray-800">{currentQuestion.text}</p>
+        </div>
+        
+        {hasAnswered && (
+            <div className={`p-4 rounded-xl mb-4 font-bold text-white ${
+                answerIndex === currentQuestion.correctAnswerIndex ? 'bg-green-600' : 'bg-red-600'
+            }`}>
+                {answerIndex === currentQuestion.correctAnswerIndex ? 'DOĞRU!' : 'YANLIŞ!'} Cevabınız kaydedildi.
+            </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-4">
+          {currentQuestion.options.map((option, index) => (
+            <Button
+              key={index}
+              onClick={() => submitAnswer(index)}
+              disabled={hasAnswered || isQuestionOver}
+              className={`
+                w-full h-20 text-xl font-extrabold shadow-lg ${colors[index]}
+                ${hasAnswered && answerIndex !== index ? 'opacity-50' : ''}
+              `}
+              color="" // Override default color with custom colors
+            >
+              {hasAnswered ? 'Gönderildi' : option}
+            </Button>
+          ))}
+        </div>
+        
+        <div className="mt-6 text-lg font-medium">
+            <p className="text-gray-700">Puanınız: <span className="text-indigo-600 font-bold">{currentPlayer.score}</span></p>
+            <p className="text-gray-700">Seri: <span className="text-green-600 font-bold">{currentPlayer.streak}</span></p>
+        </div>
+      </div>
+    );
+  };
+  
+  // Scoreboard Screen (Admin & Player)
+  const Scoreboard = () => {
+    if (!game) return <div className="text-center text-xl text-red-500">Oyun yüklenemedi.</div>;
+
+    const isFinal = game.currentQuestionIndex >= game.questions.length;
+    
+    return (
+      <div className="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-2xl text-center">
+        <h2 className={`text-4xl font-extrabold mb-2 ${isFinal ? 'text-green-700' : 'text-indigo-700'}`}>
+          {isFinal ? 'OYUN BİTTİ!' : 'SKOR TABLOSU'}
+        </h2>
+        <p className="text-xl text-gray-600 mb-8">
+          {isFinal ? 'Nihai Sonuçlar' : `Soru ${game.currentQuestionIndex} Sonrası Durum`}
+        </p>
+
+        <div className="space-y-3">
+          {sortedPlayers.map((player, index) => (
+            <div 
+              key={player.name} 
+              className={`flex justify-between items-center p-4 rounded-xl shadow-md transition duration-300 
+                ${player.isCurrentUser ? 'bg-indigo-100 border-2 border-indigo-500' : 'bg-gray-50'}`}
+            >
+              <div className="flex items-center space-x-4">
+                <span className={`text-2xl font-black w-8 ${index === 0 ? 'text-yellow-500' : index === 1 ? 'text-gray-400' : index === 2 ? 'text-amber-700' : 'text-gray-500'}`}>
+                  #{player.rank}
+                </span>
+                <span className="text-xl font-semibold text-gray-800">{player.name}</span>
+                {player.isCurrentUser && <span className="text-xs font-bold text-indigo-600 bg-indigo-200 px-2 py-0.5 rounded-full">Siz</span>}
+              </div>
+              <div className="text-right">
+                <p className="text-2xl font-extrabold text-green-700">{player.score}</p>
+                <p className="text-sm text-gray-500">Seri: {player.streak}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+        
+        {isAdmin && !isFinal && (
+          <div className="mt-8 border-t pt-4">
+            <Button onClick={nextQuestion} className="w-full">
+              Sonraki Soruya Geç ({game.currentQuestionIndex + 1} / {game.questions.length})
+            </Button>
+          </div>
+        )}
+        
+        {isAdmin && isFinal && (
+             <div className="mt-8 border-t pt-4">
+                <p className="text-lg font-bold text-gray-700">Tebrikler, oyun sona erdi!</p>
+            </div>
+        )}
+      </div>
+    );
+  };
+
+
+  // Welcome Screen (Initial view)
+  const WelcomeScreen = () => {
+    return (
+      <div className="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md text-center">
+        <h1 className="text-4xl font-black text-indigo-700 mb-2">Ramoot</h1>
+        <p className="text-lg text-gray-600 mb-8">Canlı Çok Oyunculu Quiz Sistemi</p>
+
+        <Input 
+          label="Oyun ID (Katılmak İçin)"
+          value={gameId}
+          onChange={(e) => setGameId(e.target.value.toUpperCase())}
+          placeholder="Örn: A1B2C3"
+        />
+        <Input 
+          label="Adın nedir?"
+          value={userName}
+          onChange={(e) => setUserName(e.target.value)}
+          placeholder="Rumuzunuz"
+        />
+        
+        <div className="space-y-4 mt-6">
+          <Button onClick={joinGame} className="w-full" disabled={!gameId || !userName}>
+            Oyuna Katıl
+          </Button>
+          <Button 
+            onClick={() => setMode('create-questions')} 
+            className="w-full" 
+            color="bg-purple-600 hover:bg-purple-700"
+          >
+            Yeni Oyun Oluştur (Admin)
+          </Button>
+        </div>
+        
+        <p className="mt-6 text-xs text-gray-400">Kullanıcı ID: {userId}</p>
+      </div>
+    );
+  };
+  
+  // --- Main Render Logic ---
+  
+  // Loading and Error States
+  if (!isAuthReady) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-50">
+        <p className="text-xl text-indigo-600">Sistem başlatılıyor...</p>
+      </div>
+    );
+  }
+  
+  // Decide which screen to show based on game state and mode
+  let Content;
+  
+  if (error) {
+    // Show error prominently
+    Content = (
+        <div className="bg-red-50 border-l-4 border-red-400 p-4 rounded-md shadow-md max-w-xl mx-auto mb-8">
+            <div className="flex items-center">
+                <span className="text-red-800 font-bold mr-3">Hata:</span>
+                <p className="text-sm text-red-700">{error}</p>
+            </div>
+        </div>
+    );
+  } else if (mode === 'create-questions') {
+    Content = <QuizCreation />;
+  } else if (gameId && game) {
+    // Game exists, check status
+    const isLobby = game.status === 'lobby';
+    const isInGame = game.status === 'in-game';
+    const isScore = game.status === 'score';
+    
+    if (isLobby) {
+      Content = <Lobby />;
+    } else if (isInGame) {
+      if (isAdmin) {
+        Content = <AdminGameScreen />;
+      } else if (currentPlayer) {
+        Content = <PlayerGameScreen />;
+      } else {
+        // Player joined, but not in game (e.g. game started before player joined)
+        Content = <div className="text-center text-xl text-red-500">Oyun başladı, katılamazsınız.</div>;
+      }
+    } else if (isScore) {
+      Content = <Scoreboard />;
+    }
+  } else {
+    // Default welcome screen
+    Content = <WelcomeScreen />;
   }
 
-  return null;
+  // Final Layout
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-4 font-sans antialiased">
+      {/* Dynamic Content Area */}
+      {Content}
+      
+      {/* Go Back Button (for non-game screens) */}
+      {(mode !== 'welcome' && !game) && (
+        <div className="mt-8">
+            <Button onClick={() => {
+                setMode('welcome'); 
+                setGameId(''); 
+                setError('');
+            }} color="bg-gray-500 hover:bg-gray-600">
+                Ana Sayfaya Dön
+            </Button>
+        </div>
+      )}
+    </div>
+  );
 };
 
-export default RamootGame;
+export default App;
