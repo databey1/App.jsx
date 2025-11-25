@@ -10,11 +10,24 @@ import {
 
 // --- Firebase ve Global Durum Yönetimi ---
 
-// Global Canvas Değişkenlerini Güvenli Kullanım
-// Canvas tarafından otomatik olarak sağlanan __app_id ve Firebase config'i kullanır.
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+// KULLANICININ İSTEĞİ ÜZERİNE, SAĞLANAN HARDBOARDED FIREBASE AYARLARI KULLANILIYOR.
+// Not: Platformun otomatik kimlik doğrulama token'ı (__initial_auth_token) çalışması için korunmuştur.
+const HARDCODED_FIREBASE_CONFIG = {
+    apiKey: "AIzaSyCWomiP6AUe13iKexXZAPibxvi67zrY11A",
+    authDomain: "ramoot-game.firebaseapp.com",
+    projectId: "ramoot-game", // Bu değer, Firestore yolunda appId olarak kullanılacaktır.
+    storageBucket: "ramoot-game.firebasestorage.app",
+    messagingSenderId: "403149392724",
+    appId: "1:403149392724:web:36fbcff884eec5bac6d6c1"
+};
+
+// Yapılandırmayı doğrudan kullan
+const firebaseConfig = HARDCODED_FIREBASE_CONFIG;
+// Firestore yolu için projectId'yi appId olarak kullan
+const appId = HARDCODED_FIREBASE_CONFIG.projectId; 
+// Platformun kritik kimlik doğrulama token'ını koru
 const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
 
 // Oyunun ana bileşeni
 const App = () => {
@@ -48,11 +61,12 @@ const App = () => {
     const initFirebase = async () => {
         try {
             if (!Object.keys(firebaseConfig).length) {
-                // Bu hata normalde Canvas ortamında oluşmamalıdır.
+                // Konfigürasyonun varlığını kontrol et
                 throw new Error("Firebase config is missing."); 
             }
             
-            const app = initializeApp(firebaseConfig);
+            // Kullanıcının sağladığı konfigürasyon ile Firebase'i başlat
+            const app = initializeApp(firebaseConfig); 
             const firestore = getFirestore(app);
             const firebaseAuth = getAuth(app);
             
@@ -72,8 +86,8 @@ const App = () => {
                             await signInAnonymously(firebaseAuth);
                         }
                     } catch (e) {
-                        console.error("Auth Error:", e);
-                        setError("Kimlik doğrulama hatası oluştu. Lütfen konsol loglarını kontrol edin.");
+                        console.error("Auth Error (Check Rules/Token Validity):", e);
+                        setError("Kimlik doğrulama hatası oluştu. (Firebase ayarlarınızı veya kurallarınızı kontrol edin)");
                     }
                 }
                 
@@ -177,7 +191,7 @@ const App = () => {
       console.log(`Game created successfully with ID: ${newGameId}`);
     } catch (e) {
       console.error("Create Game Error:", e);
-      setError("Oyun oluşturulurken bir hata oluştu. (Yol hatası olabilir)");
+      setError("Oyun oluşturulurken bir hata oluştu. (Yol hatası veya Firestore kurallarını kontrol edin)");
     } finally {
       setLoading(false);
     }
@@ -639,7 +653,7 @@ const App = () => {
     const answerIndex = game.playerAnswers[userId]?.answerIndex;
     
     // Yöneticinin sonraki soruya geçtiği anlamına gelen basit bir vekil kontrol
-    const isQuestionOver = game.status === 'in-game' && game.answersReceived[game.adminId]; 
+    const isQuestionOver = game.status !== 'in-game'; 
 
     return (
       <div className="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-2xl text-center">
